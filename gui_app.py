@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import math
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk, filedialog, messagebox
 
 from models import Project
 from system_stats import MySystem
-from io_csv import load_projects_csv, save_projects_csv
+from io_csv import load_projects, save_projects_csv
 from rbf_predictor import rbf_predict, RBFWeights
 
 
@@ -22,7 +23,7 @@ class App(ttk.Frame):
 
         self.base_dir = Path(__file__).parent
         self.system = MySystem()
-        self.weights: RBFWeights | None = None
+        self.weights: dict[str, RBFWeights] = {}
 
         # Stored results for comparison
         self.res_cost = 0.0
@@ -49,8 +50,8 @@ class App(ttk.Frame):
 
         self._setup_data_tab()
         # Setup specific tabs for Cost and Schedule
-        self._setup_predict_tab(self.tab_cost, "Cost (Settlement)", lambda p: p.settlement_raw)
-        self._setup_predict_tab(self.tab_sched, "Schedule (Duration)", lambda p: p.duration_actual)
+        self._setup_predict_tab(self.tab_cost, "Cost (Settlement)", "settlement", lambda p: p.settlement_raw)
+        self._setup_predict_tab(self.tab_sched, "Schedule (Duration)", "duration", lambda p: p.duration_actual)
         self._setup_compare_tab()
 
     def _setup_data_tab(self) -> None:
@@ -69,7 +70,7 @@ class App(ttk.Frame):
         self.lbl_status = ttk.Label(self.tab_data, text="", foreground="gray")
         self.lbl_status.grid(row=row, column=0, columnspan=3, sticky="w", padx=5)
 
-    def _setup_predict_tab(self, tab, title, y_getter):
+    def _setup_predict_tab(self, tab, title, target, y_getter):
         """Standardized layout for prediction tabs."""
         # Shared input frame
         frm = ttk.LabelFrame(tab, text=f"輸入測試案例特徵 - {title}")
@@ -102,7 +103,7 @@ class App(ttk.Frame):
 
         # Estimation Button
         btn = ttk.Button(tab, text=f"執行 {title} 核心推估",
-                         command=lambda: self._run_prediction(title, y_getter, inputs, ent_rad, tab))
+                         command=lambda: self._run_prediction(title, target, y_getter, inputs, ent_rad, tab))
         btn.pack(pady=10)
 
         # Output Text
@@ -128,28 +129,32 @@ class App(ttk.Frame):
 
         ttk.Button(frm, text="更新比較數據", command=self._refresh_comparison).pack(pady=30)
 
-    def _run_prediction(self, mode, y_getter, inputs, ent_rad, tab):
+    def _run_prediction(self, mode, target, y_getter, inputs, ent_rad, tab):
         if not self.system.projects:
             messagebox.showwarning("錯誤", "請先載入訓練資料。")
             return
 
         try:
             rad = float(ent_rad.get().strip())
-        except:
-            rad = 1.0
+            if not math.isfinite(rad) or rad <= 0:
+                raise ValueError
+            values = {key: float(entry.get().strip()) for key, entry in inputs.items()}
+            if not all(math.isfinite(value) for value in values.values()):
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("輸入錯誤", "所有特徵與 Radius 必須是有效數字，且 Radius 必須大於 0。")
+            return
 
-        test = Project(
-            id=0, name="test",
-            procurement_raw=float(inputs["procurement_raw"].get() or 0),
-            tender_value_raw=float(inputs["tender_value_raw"].get() or 0),
-            floor_raw=float(inputs["floor_raw"].get() or 0),
-            basement_raw=float(inputs["basement_raw"].get() or 0),
-            floor_area_raw=float(inputs["floor_area_raw"].get() or 0),
-            pre_duration_raw=float(inputs["pre_duration_raw"].get() or 0),
-        )
+        test = Project(id=0, name="test", **values)
         test.system = self.system
 
-        y_hat, top_cases = rbf_predict(test, self.system.projects, y_getter, rad=rad, weights=self.weights)
+        y_hat, top_cases = rbf_predict(
+            test,
+            self.system.projects,
+            y_getter,
+            rad=rad,
+            weights=self.weights.get(target),
+        )
 
         if "Cost" in mode:
             self.res_cost = y_hat
@@ -172,13 +177,13 @@ class App(ttk.Frame):
 
     # --- Autoload and Helper methods (Same as original) ---
     def _autoload_data(self):
-        csv_path = self.base_dir / "data.csv"
-        if csv_path.exists():
+        data_path = self.base_dir / "dataset" / "完整案例庫_新增BIM標註.xls"
+        if data_path.exists():
             try:
-                self.system.projects = load_projects_csv(csv_path)
+                self.system.projects = load_projects(data_path)
                 self.system.attach()
                 self._refresh_stats()
-                self._set_status(f"自動載入 data.csv 成功 ({len(self.system.projects)} 筆)")
+                self._set_status(f"自動載入測試資料成功 ({len(self.system.projects)} 筆)")
             except Exception as e:
                 self._set_status(f"載入失敗: {e}")
 
@@ -187,10 +192,15 @@ class App(ttk.Frame):
         if wpath.exists():
             try:
                 with wpath.open("r", encoding="utf-8") as f:
-                    w = json.load(f).get("weights", {})
-                self.weights = RBFWeights(**{k: float(v) for k, v in w.items()})
-            except:
-                self.weights = None
+                    models = json.load(f).get("models", {})
+                self.weights = {
+                    target: RBFWeights(**{key: float(value) for key, value in model["weights"].items()})
+                    for target, model in models.items()
+                    if target in {"duration", "settlement"} and isinstance(model, dict) and "weights" in model
+                }
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                self.weights = {}
+                self._set_status(f"權重檔載入失敗: {error}")
 
     def _set_status(self, msg):
         self.lbl_status.config(text=msg)
@@ -200,19 +210,27 @@ class App(ttk.Frame):
         self.lbl_stats.config(text=f"已載入 {n} 筆案例資料。")
 
     def load_csv(self):
-        path = filedialog.askopenfilename(filetypes=[("CSV", "*.csv")])
+        path = filedialog.askopenfilename(filetypes=[("Data files", "*.csv *.xls"), ("CSV", "*.csv"), ("Excel", "*.xls")])
         if path:
-            self.system.projects = load_projects_csv(path)
-            self.system.attach()
-            self._refresh_stats()
+            try:
+                self.system.projects = load_projects(path)
+                self.system.attach()
+                self._refresh_stats()
+                self._set_status(f"已載入 {Path(path).name} ({len(self.system.projects)} 筆)")
+            except (OSError, ValueError, RuntimeError) as error:
+                messagebox.showerror("載入失敗", str(error))
 
     def export_csv(self):
         path = filedialog.asksaveasfilename(defaultextension=".csv")
-        if path: save_projects_csv(path, self.system.projects)
+        if path:
+            try:
+                save_projects_csv(path, self.system.projects)
+            except OSError as error:
+                messagebox.showerror("匯出失敗", str(error))
 
     def reload_weights(self):
         self._autoload_weights()
-        messagebox.showinfo("OK", "權重已更新。")
+        messagebox.showinfo("OK", f"已載入 {len(self.weights)} 組權重。")
 
 
 def main() -> None:
@@ -223,4 +241,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

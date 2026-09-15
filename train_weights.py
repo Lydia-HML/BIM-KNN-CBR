@@ -4,7 +4,7 @@ from __future__ import annotations
 train_weights.py
 ================
 
-Learn feature weights for the RBF-style predictor in this project (pure Python, no extra deps).
+Learn feature weights for the RBF-style predictor in this project.
 
 Why this exists
 ---------------
@@ -13,7 +13,7 @@ This script replaces that idea with a lightweight, reproducible search that work
 
 What it does
 ------------
-- Loads projects from data.csv (or a user-provided CSV).
+- Loads projects from the bundled XLS dataset (or a user-provided CSV/XLS file).
 - Computes system stats (means/standard deviations) and attaches them so z-scores work.
 - Searches for positive weights that minimize prediction error via cross-validation.
 
@@ -30,7 +30,7 @@ MAE (mean absolute error) using Leave-One-Out CV.
 Usage
 -----
 python train_weights.py --target duration --iters 6000 --seed 42
-python train_weights.py --target settlement --rad 0.8 --iters 8000
+python train_weights.py --target settlement --data my_cases.csv --rad 0.8 --iters 8000
 
 Outputs
 -------
@@ -44,7 +44,7 @@ import math
 import random
 from dataclasses import asdict
 
-from io_csv import load_projects_csv
+from io_csv import load_projects
 from models import Project
 from rbf_predictor import RBFWeights, rbf_predict
 from system_stats import MySystem
@@ -119,7 +119,7 @@ def propose(current: list[float], step: float) -> list[float]:
         # jitter in log-space
         factor = math.exp(random.uniform(-step, step))
         out.append(max(1e-6, w * factor))
-    return out
+    return normalize(out)
 
 
 def to_weights(vec: list[float]) -> RBFWeights:
@@ -145,7 +145,7 @@ def normalize(vec: list[float]) -> list[float]:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", default="data.csv", help="Training CSV (default: data.csv)")
+    ap.add_argument("--data", default="dataset/完整案例庫_新增BIM標註.xls", help="Training CSV or XLS file")
     ap.add_argument("--target", choices=["duration", "settlement"], default="duration")
     ap.add_argument("--metric", choices=["mae", "rmse"], default="mae")
     ap.add_argument("--rad", type=float, default=1.0, help="RBF rad parameter (default: 1.0)")
@@ -154,7 +154,6 @@ def main() -> None:
     ap.add_argument("--step0", type=float, default=0.35, help="Initial log-step (default: 0.35)")
     ap.add_argument("--cool", type=float, default=0.9995, help="Cooling rate per iter (default: 0.9995)")
     ap.add_argument("--max-train", type=int, default=120, help="Subsample training cases per fold for speed (default: 120)")
-    ap.add_argument("--no-normalize", action="store_true", help="Don't normalize final weights")
     args = ap.parse_args()
 
     base_dir = __import__('pathlib').Path(__file__).parent
@@ -162,10 +161,10 @@ def main() -> None:
 
     # Load data
     system = MySystem()
-    csv_path = __import__('pathlib').Path(args.csv)
-    if not csv_path.is_absolute():
-        csv_path = base_dir / csv_path
-    system.projects = load_projects_csv(csv_path)
+    data_path = __import__('pathlib').Path(args.data)
+    if not data_path.is_absolute():
+        data_path = base_dir / data_path
+    system.projects = load_projects(data_path)
     system.attach()
 
     # Ensure test projects can compute z-scores
@@ -225,17 +224,19 @@ def main() -> None:
         if t % max(200, args.iters // 20) == 0:
             print(f"[{t:>6}/{args.iters}] best_{args.metric}={best_score:.6f}  step={step:.4f}")
 
-    if not args.no_normalize:
-        best_vec = normalize(best_vec)
-        best_w = to_weights(best_vec)
-
     print("\n=== BEST WEIGHTS ===")
     print(f"target={args.target}  metric={args.metric}  rad={args.rad}")
     print(json.dumps(asdict(best_w), ensure_ascii=False, indent=2))
     print(f"{args.metric} (LOO-CV) = {best_score:.6f}")
 
-    out = {
-        "target": args.target,
+    out_path = base_dir / "weights.json"
+    out = {"version": 1, "models": {}}
+    if out_path.exists():
+        with out_path.open(encoding="utf-8") as f:
+            existing = json.load(f)
+        if isinstance(existing.get("models"), dict):
+            out = existing
+    out["models"][args.target] = {
         "metric": args.metric,
         "rad": args.rad,
         "seed": args.seed,
@@ -243,7 +244,6 @@ def main() -> None:
         "best_score": best_score,
         "weights": asdict(best_w),
     }
-    out_path = base_dir / "weights.json"
     with out_path.open("w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
 
